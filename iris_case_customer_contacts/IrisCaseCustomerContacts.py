@@ -1,79 +1,91 @@
 #!/usr/bin/env python3
 
 import html
+
 from iris_interface.IrisModuleInterface import (
     IrisModuleInterface,
-    IrisModuleTypes,
     InterfaceStatus,
 )
 from . import IrisCaseCustomerContactsConfig as interface_conf
 
 
-def build_case_contact_dropdown(case, logger, iris_api):
+# Names of your custom attribute group & fields in the Case custom attributes JSON
+CUSTOM_ATTR_GROUP = "Customer contacts"
+CUSTOM_ATTR_DROPDOWN = "Customer contact selector"
+CUSTOM_ATTR_HIDDEN_ID = "Customer contact ID"
+
+
+def build_case_contact_dropdown(case, module):
     """
-    Your original run() function, slightly refactored into a helper.
+    Core logic: fetch contacts for this case's customer, build HTML dropdown,
+    and update custom attributes on the case.
     """
 
-    # ---- 1. Identify case & customer ----
+    log = module.log
+    iris_api = module.api
+
+    # --- 1. Identify case & customer ---
+
     cid = case.get("case_id") or case.get("id")
     if not cid:
-        logger.error("Could not determine case ID from context.")
-        return InterfaceStatus.I2Error(message="No case_id in context.")
+        log.error("No case_id / id found in case data.")
+        return
 
     customer = case.get("customer") or {}
     customer_id = customer.get("customer_id")
     if not customer_id:
-        logger.warning(f"Case {cid} has no associated customer.")
-        return InterfaceStatus.I2Error(message="No customer on this case.")
+        log.warning(f"[Case {cid}] No customer assigned, cannot build contact dropdown.")
+        return
 
-    logger.info(f"[case={cid}] Loading contacts for customer_id={customer_id}")
+    log.info(f"[Case {cid}] Building contact dropdown for customer_id={customer_id}")
 
-    # ---- 2. Fetch contacts for this customer ----
+    # Contacts endpoint template comes from module configuration
+    contacts_endpoint_tmpl = module._dict_conf.get(
+        "contacts_endpoint",
+        "/customers/{customer_id}/contacts"
+    )
+    endpoint = contacts_endpoint_tmpl.format(customer_id=customer_id)
+
+    # --- 2. Fetch contacts for this customer ---
+
     try:
-        # Adjust this endpoint to match your IRIS API
-        resp = iris_api.get(f"/customers/{customer_id}/contacts")
+        resp = iris_api.get(endpoint)
         resp.raise_for_status()
         contacts = resp.json()
     except Exception as e:
-        logger.error(f"Error while calling /customers/{customer_id}/contacts: {e}")
-        return InterfaceStatus.I2Error(message="Could not retrieve contacts from IRIS API.")
+        log.error(f"[Case {cid}] Error calling {endpoint}: {e}")
+        return
 
-    ca = case.get("custom_attributes", {})
+    # Get custom attributes dict (copy reference; IRIS expects same structure back)
+    ca = case.get("custom_attributes") or {}
 
+    # Ensure our group/fields exist in the dict
+    ca.setdefault(CUSTOM_ATTR_GROUP, {})
+    ca[CUSTOM_ATTR_GROUP].setdefault(CUSTOM_ATTR_DROPDOWN, {"value": ""})
+    ca[CUSTOM_ATTR_GROUP].setdefault(CUSTOM_ATTR_HIDDEN_ID, {"value": ""})
+
+    # If no contacts, show message and clear dropdown
     if not contacts:
-        logger.info(f"[case={cid}] No contacts for customer_id={customer_id}")
+        log.info(f"[Case {cid}] No contacts for customer_id={customer_id}")
+        ca[CUSTOM_ATTR_GROUP][CUSTOM_ATTR_DROPDOWN]["value"] = (
+            "<p>No contacts for this customer.</p>"
+        )
         try:
-            ca["Customer contacts"]["Customer contact selector"]["value"] = (
-                "<p>No contacts for this customer.</p>"
-            )
-        except Exception:
-            return InterfaceStatus.I2Error(
-                message="Custom attributes structure missing (Customer contacts / Customer contact selector)."
-            )
+            iris_api.patch(f"/cases/{cid}", json={"custom_attributes": ca})
+        except Exception as e:
+            log.error(f"[Case {cid}] Error updating case custom_attributes: {e}")
+        return
 
-        iris_api.patch(f"/cases/{cid}", json={"custom_attributes": ca})
-        return InterfaceStatus.I2Success(
-            data=case,
-            logs=list(logger.handlers),
-            message="No contacts found for this customer.",
-        )
+    # --- 3. Build HTML <select> with options ---
 
-    # ---- 3. Build HTML <select> for this specific case ----
+    # Read current stored contact ID (hidden field)
+    current_contact_id = ca[CUSTOM_ATTR_GROUP][CUSTOM_ATTR_HIDDEN_ID].get("value") or ""
 
-    # Current selected contact ID
-    try:
-        current_contact_id = (
-            ca
-            .get("Customer contacts", {})
-            .get("Customer contact ID", {})
-            .get("value", "")
-        )
-    except Exception:
-        current_contact_id = ""
-
+    # Build <option> elements
     options_html = []
     for c in contacts:
         contact_id = str(c.get("id"))
+        # adapt these keys to your contacts schema
         name = c.get("name") or c.get("full_name") or "Unnamed"
         email = c.get("email") or ""
         label = f"{name} ({email})" if email else name
@@ -85,11 +97,13 @@ def build_case_contact_dropdown(case, logger, iris_api):
 
     options_html_str = "".join(options_html)
 
-    # IMPORTANT:
-    # You must inspect the DOM once to get the actual ID of the input
-    # backing "Customer contact ID". Temporarily assume:
-    hidden_input_dom_id = "inpstd_2_customer_contact_id"
+    # Hidden input DOM ID from module configuration
+    hidden_input_dom_id = module._dict_conf.get(
+        "hidden_input_dom_id",
+        "inpstd_2_customer_contact_id"  # you will update this after inspecting
+    )
 
+    # HTML & JS injected into the HTML custom attribute
     html_value = f"""
 <label>Customer contact</label>
 <select class='selectpicker form-control'
@@ -101,23 +115,26 @@ def build_case_contact_dropdown(case, logger, iris_api):
 (function() {{
     var hiddenInputId = '#{hidden_input_dom_id}';
 
-    // Disable manual editing in the form
+    // Protect hidden field from manual typing
     $(hiddenInputId).attr('disabled', 'disabled');
 
     // Existing value (if any)
     var currentVal = $(hiddenInputId).val();
 
+    // Initialize bootstrap selectpicker
     $('#select_case_customer_contact').selectpicker({{
         liveSearch: true,
         title: 'Select contact',
         style: 'btn-outline-white'
     }});
 
+    // Restore previous selection if there is one
     if (currentVal) {{
         $('#select_case_customer_contact').val(currentVal);
         $('#select_case_customer_contact').selectpicker('refresh');
     }}
 
+    // Keep hidden field in sync with selected contact ID
     $('#select_case_customer_contact').on(
         'changed.bs.select',
         function (e, clickedIndex, newValue, oldValue) {{
@@ -129,28 +146,28 @@ def build_case_contact_dropdown(case, logger, iris_api):
 </script>
     """.strip()
 
+    # Set the generated HTML into our HTML custom attribute
+    ca[CUSTOM_ATTR_GROUP][CUSTOM_ATTR_DROPDOWN]["value"] = html_value
+
+    # --- 4. Push updated custom attributes back to the case ---
+
     try:
-        ca.setdefault("Customer contacts", {})
-        ca["Customer contacts"].setdefault("Customer contact selector", {})
-        ca["Customer contacts"]["Customer contact selector"]["value"] = html_value
+        iris_api.patch(f"/cases/{cid}", json={"custom_attributes": ca})
     except Exception as e:
-        logger.error(f"Error updating custom_attributes structure: {e}")
-        return InterfaceStatus.I2Error(
-            message="Custom attributes structure does not match expected JSON."
-        )
+        log.error(f"[Case {cid}] Error updating case custom_attributes: {e}")
+        return
 
-    iris_api.patch(f"/cases/{cid}", json={"custom_attributes": ca})
-
-    logger.info(f"[case={cid}] Contact dropdown updated with {len(contacts)} options.")
-    return InterfaceStatus.I2Success(
-        data=case,
-        logs=list(logger.handlers),
-        message=f"Contact dropdown updated with {len(contacts)} contacts.",
-    )
+    log.info(f"[Case {cid}] Contact dropdown updated with {len(contacts)} contacts.")
 
 
 class IrisCaseCustomerContacts(IrisModuleInterface):
-    # Basic module metadata from config
+    """
+    Processor module:
+    - Subscribes to on_manual_trigger_case
+    - When triggered on a case, it builds / refreshes the Case's customer contact dropdown.
+    """
+
+    # config from config file
     _module_name = interface_conf.module_name
     _module_description = interface_conf.module_description
     _interface_version = interface_conf.interface_version
@@ -162,11 +179,9 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
 
     def register_hooks(self, module_id: int):
         """
-        Tell IRIS which hook(s) we want.
-        For a manual case processor, use the appropriate case hook.
+        Called by IRIS when it's time to subscribe to hooks.
+        We subscribe to the manual case trigger: on_manual_trigger_case
         """
-        # This hook name is illustrative; check your Hooks docs / UI for the
-        # exact name IRIS uses when you run a module manually on a case.
         status = self.register_to_hook(
             module_id,
             iris_hook_name="on_manual_trigger_case"
@@ -175,21 +190,34 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
         if status.is_failure():
             self.log.error(status.get_message())
         else:
-            self.log.info("Subscribed to on_manual_case_processor hook")
+            self.log.info("Successfully subscribed to on_manual_trigger_case hook")
+
+        # If you ALSO want it to run automatically when cases are updated,
+        # you can optionally subscribe to this second hook:
+        #
+        # auto_status = self.register_to_hook(
+        #     module_id,
+        #     iris_hook_name="on_postload_case_update"
+        # )
+        # if auto_status.is_failure():
+        #     self.log.error(auto_status.get_message())
+        # else:
+        #     self.log.info("Successfully subscribed to on_postload_case_update hook")
 
     def hooks_handler(self, hook_name: str, data):
         """
-        Called by IRIS whenever our hook fires.
-        For a manual case processor, `data` will be the case object.
+        Called each time one of our hooks is triggered.
+
+        For on_manual_trigger_case, `data` is the case object.
         """
+        self.log.info(f"Case Customer Contacts module received hook {hook_name}")
+
         try:
-            result = build_case_contact_dropdown(
-                case=data,
-                logger=self.log,
-                iris_api=self.api,
-            )
-            return result
+            # Only handle case-related hooks here
+            if hook_name in ("on_manual_trigger_case", "on_postload_case_update"):
+                build_case_contact_dropdown(case=data, module=self)
         except Exception as e:
             self.log.error(f"Error in Case Customer Contacts module: {e}")
-            return InterfaceStatus.I2Error(message=str(e), logs=list(self.message_queue))
 
+        # Always return success with (possibly updated) data
+        return InterfaceStatus.I2Success(data=data, logs=list(self.message_queue))
