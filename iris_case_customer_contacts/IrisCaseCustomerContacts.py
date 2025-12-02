@@ -169,7 +169,7 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
         # exact name IRIS uses when you run a module manually on a case.
         status = self.register_to_hook(
             module_id,
-            iris_hook_name="on_manual_case_processor"
+            iris_hook_name="on_postload_case_update"
         )
 
         if status.is_failure():
