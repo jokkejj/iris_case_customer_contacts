@@ -4,7 +4,8 @@ import html
 
 from iris_interface.IrisModuleInterface import (
     IrisModuleInterface,
-    InterfaceStatus,
+    IrisInterfaceStatus,
+    IrisModuleTypes,
 )
 from . import IrisCaseCustomerContactsConfig as interface_conf
 
@@ -19,30 +20,40 @@ def build_case_contact_dropdown(case, module):
     """
     Core logic: fetch contacts for this case's customer, build HTML dropdown,
     and update custom attributes on the case.
+
+    Returns an IrisInterfaceStatus object.
     """
 
     log = module.log
     iris_api = module.api
+    conf = module._dict_conf or {}
 
     # --- 1. Identify case & customer ---
 
     cid = case.get("case_id") or case.get("id")
     if not cid:
         log.error("No case_id / id found in case data.")
-        return
+        return IrisInterfaceStatus.I2Error(
+            message="No case_id / id found in case data.",
+            logs=list(module.message_queue),
+        )
 
     customer = case.get("customer") or {}
     customer_id = customer.get("customer_id")
     if not customer_id:
-        log.warning(f"[Case {cid}] No customer assigned, cannot build contact dropdown.")
-        return
+        msg = f"[Case {cid}] No customer assigned, cannot build contact dropdown."
+        log.warning(msg)
+        return IrisInterfaceStatus.I2Error(
+            message=msg,
+            logs=list(module.message_queue),
+        )
 
     log.info(f"[Case {cid}] Building contact dropdown for customer_id={customer_id}")
 
-    # Contacts endpoint template comes from module configuration
-    contacts_endpoint_tmpl = module._dict_conf.get(
+    # Contacts endpoint template comes from module configuration (optional)
+    contacts_endpoint_tmpl = conf.get(
         "contacts_endpoint",
-        "/customers/{customer_id}/contacts"
+        "/customers/{customer_id}/contacts",
     )
     endpoint = contacts_endpoint_tmpl.format(customer_id=customer_id)
 
@@ -53,8 +64,12 @@ def build_case_contact_dropdown(case, module):
         resp.raise_for_status()
         contacts = resp.json()
     except Exception as e:
-        log.error(f"[Case {cid}] Error calling {endpoint}: {e}")
-        return
+        msg = f"[Case {cid}] Error calling {endpoint}: {e}"
+        log.error(msg)
+        return IrisInterfaceStatus.I2Error(
+            message=msg,
+            logs=list(module.message_queue),
+        )
 
     # Get custom attributes dict (copy reference; IRIS expects same structure back)
     ca = case.get("custom_attributes") or {}
@@ -73,8 +88,18 @@ def build_case_contact_dropdown(case, module):
         try:
             iris_api.patch(f"/cases/{cid}", json={"custom_attributes": ca})
         except Exception as e:
-            log.error(f"[Case {cid}] Error updating case custom_attributes: {e}")
-        return
+            msg = f"[Case {cid}] Error updating case custom_attributes: {e}"
+            log.error(msg)
+            return IrisInterfaceStatus.I2Error(
+                message=msg,
+                logs=list(module.message_queue),
+            )
+
+        return IrisInterfaceStatus.I2Success(
+            data=case,
+            logs=list(module.message_queue),
+            message="No contacts found for this customer.",
+        )
 
     # --- 3. Build HTML <select> with options ---
 
@@ -97,10 +122,10 @@ def build_case_contact_dropdown(case, module):
 
     options_html_str = "".join(options_html)
 
-    # Hidden input DOM ID from module configuration
-    hidden_input_dom_id = module._dict_conf.get(
+    # Hidden input DOM ID from module configuration (or default; update after inspecting)
+    hidden_input_dom_id = conf.get(
         "hidden_input_dom_id",
-        "inpstd_2_customer_contact_id"  # you will update this after inspecting
+        "inpstd_2_customer_contact_id",  # TODO: replace with the real DOM id
     )
 
     # HTML & JS injected into the HTML custom attribute
@@ -154,10 +179,20 @@ def build_case_contact_dropdown(case, module):
     try:
         iris_api.patch(f"/cases/{cid}", json={"custom_attributes": ca})
     except Exception as e:
-        log.error(f"[Case {cid}] Error updating case custom_attributes: {e}")
-        return
+        msg = f"[Case {cid}] Error updating case custom_attributes: {e}"
+        log.error(msg)
+        return IrisInterfaceStatus.I2Error(
+            message=msg,
+            logs=list(module.message_queue),
+        )
 
     log.info(f"[Case {cid}] Contact dropdown updated with {len(contacts)} contacts.")
+
+    return IrisInterfaceStatus.I2Success(
+        data=case,
+        logs=list(module.message_queue),
+        message=f"Contact dropdown updated with {len(contacts)} contacts.",
+    )
 
 
 class IrisCaseCustomerContacts(IrisModuleInterface):
@@ -184,7 +219,7 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
         """
         status = self.register_to_hook(
             module_id,
-            iris_hook_name="on_manual_trigger_case"
+            iris_hook_name="on_manual_trigger_case",
         )
 
         if status.is_failure():
@@ -192,12 +227,10 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
         else:
             self.log.info("Subscribed to on_manual_trigger_case hook")
 
-        # If you ALSO want it to run automatically when cases are updated,
-        # you can optionally subscribe to this second hook:
-        #
+        # Optional: also auto-run when a case is updated
         # auto_status = self.register_to_hook(
         #     module_id,
-        #     iris_hook_name="on_postload_case_update"
+        #     iris_hook_name="on_postload_case_update",
         # )
         # if auto_status.is_failure():
         #     self.log.error(auto_status.get_message())
@@ -211,14 +244,14 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
         For on_manual_trigger_case, `data` is the case object.
         """
         try:
+            # Just delegate to our helper and return its IrisInterfaceStatus
             return build_case_contact_dropdown(
                 case=data,
-                logger=self.log,
-                iris_api=self.api,
+                module=self,
             )
         except Exception as e:
             self.log.error(f"Error in Case Customer Contacts module: {e}")
-            return InterfaceStatus.I2Error(
+            return IrisInterfaceStatus.I2Error(
                 message=str(e),
                 logs=list(self.message_queue),
             )
