@@ -190,7 +190,7 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
         if status.is_failure():
             self.log.error(status.get_message())
         else:
-            self.log.info("Successfully subscribed to on_manual_trigger_case hook")
+            self.log.info("Subscribed to on_manual_trigger_case hook")
 
         # If you ALSO want it to run automatically when cases are updated,
         # you can optionally subscribe to this second hook:
@@ -210,14 +210,15 @@ class IrisCaseCustomerContacts(IrisModuleInterface):
 
         For on_manual_trigger_case, `data` is the case object.
         """
-        self.log.info(f"Case Customer Contacts module received hook {hook_name}")
-
         try:
-            # Only handle case-related hooks here
-            if hook_name in ("on_manual_trigger_case", "on_postload_case_update"):
-                build_case_contact_dropdown(case=data, module=self)
+            return build_case_contact_dropdown(
+                case=data,
+                logger=self.log,
+                iris_api=self.api,
+            )
         except Exception as e:
             self.log.error(f"Error in Case Customer Contacts module: {e}")
-
-        # Always return success with (possibly updated) data
-        return InterfaceStatus.I2Success(data=data, logs=list(self.message_queue))
+            return InterfaceStatus.I2Error(
+                message=str(e),
+                logs=list(self.message_queue),
+            )
